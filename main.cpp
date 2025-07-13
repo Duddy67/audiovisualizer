@@ -14,6 +14,7 @@
 #include <functional>
 
 
+
 // ---- Audio Class ----
 class Audio {
 public:
@@ -27,7 +28,7 @@ public:
     bool init(const std::vector<float>& data, int rate);
 
     void start() {
-        playbackSampleIndex = 0;
+        //playbackSampleIndex = 0;
         ma_device_start(&device);
     }
 
@@ -91,6 +92,7 @@ public:
     std::function<void(int)> onSeekCallback;
 
     void setOnSeekCallback(std::function<void(int)> callback) {
+        // Assign the function variable.
         onSeekCallback = callback;
     }
 
@@ -133,10 +135,14 @@ public:
     int getScrollOffset() const { return scrollOffset; }
     float getZoomLevel() const { return zoomLevel; }
     bool isPlaying() const { return playing; }
+    bool isPaused() const { return paused; }
+    int getPlaybackSample() const { return playbackSample; }
 
     // Setters.
 
+    int getMovedCursorSample() const { return movedCursorSample; }
     void setPlaying(bool state) { playing = state; }
+    void setPaused(bool state) { paused = state; }
     void setPlaybackSample(int sample) {
         playbackSample = sample;
         redraw();
@@ -250,26 +256,15 @@ protected:
     }
 
     int handle(int event) override {
-        // Zoom with mouse wheel
-        /*if (event == FL_MOUSEWHEEL) {
-            // 1.1f = zoom in / 0.9f = zoom out.
-            zoomLevel *= (Fl::event_dy() < 0) ? 1.1f : 0.9f;
-
-            zoomLevel = std::clamp(zoomLevel, zoomMin, 100.0f);
-
-            int visibleSamples = static_cast<int>(w() / zoomLevel);
-            int maxOffset = std::max(0, (int)samples.size() - visibleSamples);
-            scrollOffset = std::clamp(scrollOffset, 0, maxOffset);
-
-            updateScrollbar();
-            redraw();
-
-            return 1;
-        }*/
-
-        //return Fl_Gl_Window::handle(event);
-
         switch (event) {
+            case FL_FOCUS:
+                std::cout << "Waveform got focus" << std::endl;
+            return 1;
+
+            case FL_UNFOCUS:
+                std::cout << "Waveform lost focus" << std::endl;
+            return 1;
+
             // Zoom with mouse wheel
             case FL_MOUSEWHEEL: {
                 // 1.1f = zoom in / 0.9f = zoom out.
@@ -287,6 +282,7 @@ protected:
                 return 1;
             }
 
+            // The user has clicked and moved the cursor along the waveform.
             case FL_PUSH: {
                 if (Fl::event_button() == FL_LEFT_MOUSE) {
                     int mouseX = Fl::event_x();
@@ -296,9 +292,11 @@ protected:
                     sample = std::clamp(sample, 0, (int)samples.size() - 1);
 
                     setPlaybackSample(sample);
+                    movedCursorSample = sample;
 
-                    // Update external audio playback if we're playing
-                    if (playing && onSeekCallback) {
+                    // Update external audio playback.
+                    if (onSeekCallback != nullptr) {
+                         // Tell the audio system to seek too.
                         onSeekCallback(sample);  // <- call external logic
                     }
 
@@ -324,6 +322,9 @@ private:
     // -1 = not playing
     int playbackSample = -1;
     bool playing = false;
+    bool paused = false;
+    // Position of the cursor when it is manually moved.
+    int movedCursorSample = 0;
 };
 
 // ---- Context Struct ----
@@ -420,6 +421,7 @@ int main(int argc, char** argv) {
 
     Fl_Window win(800, 400, "Waveform Viewer");
     auto* waveform = new WaveformView(10, 10, 780, 280);
+    waveform->take_focus();  // Request keyboard focus
 
     auto* scrollbar = new Fl_Scrollbar(10, 295, 780, 15);
     scrollbar->type(FL_HORIZONTAL);
@@ -437,18 +439,88 @@ int main(int argc, char** argv) {
 
     auto* ctx = new AppContext{ audio, waveform };
 
+    // --- Play Button ---
     Fl_Button* playBtn = new Fl_Button(10, 320, 80, 30, "Play");
 
     playBtn->callback([](Fl_Widget*, void* userData) {
         auto* ctx = static_cast<AppContext*>(userData);
         if (!ctx->view->isPlaying()) {
             ctx->view->setPlaying(true);
-            ctx->view->setPlaybackSample(0);
+
+            if (ctx->view->isPaused()) {
+                int resetTo = ctx->view->getMovedCursorSample();
+                ctx->audio->playbackSampleIndex = resetTo;
+                // Redraw cursor to its initial position.
+                ctx->view->setPlaybackSample(resetTo);  
+            }
+            else {
+                ctx->view->setPlaybackSample(0);
+            }
+
             ctx->audio->start();
+            Fl::add_timeout(0.016, update_cursor_timer, ctx);
+        }
+        else {
+            int resetTo = ctx->view->getMovedCursorSample();
+            ctx->audio->playbackSampleIndex = resetTo;
+            // Redraw cursor to its initial position.
+            ctx->view->setPlaybackSample(resetTo);  
+        }
+    }, ctx);
+
+    // --- Stop Button ---
+    Fl_Button* stopBtn = new Fl_Button(100, 320, 80, 30, "Stop");
+
+    stopBtn->callback([](Fl_Widget*, void* userData) {
+        auto* ctx = static_cast<AppContext*>(userData);
+        auto* view = ctx->view;
+        auto* audio = ctx->audio;
+
+        if (view->isPlaying()) {
+            view->setPlaying(false);
+            ma_device_stop(&audio->device);
+        }
+
+        // Cancel possible pause state.
+        view->setPaused(false);
+
+        int resetTo = view->getMovedCursorSample();
+        audio->playbackSampleIndex = resetTo;
+        // Redraw cursor to its initial position.
+        view->setPlaybackSample(resetTo);  
+    }, ctx);
+
+    // --- Pause Button ---
+    Fl_Button* pauseBtn = new Fl_Button(190, 320, 80, 30, "Pause");
+
+    pauseBtn->callback([](Fl_Widget*, void* userData) {
+        auto* ctx = static_cast<AppContext*>(userData);
+        auto* view = ctx->view;
+        auto* audio = ctx->audio;
+
+        if (view->isPlaying()) {
+            // Pause
+            view->setPlaying(false);
+            view->setPaused(true);
+            ma_device_stop(&audio->device);
+        }
+        else if (view->isPaused() && !view->isPlaying()) {
+            // Resume from where playback paused
+            int resumeSample = view->getPlaybackSample();
+            audio->playbackSampleIndex = resumeSample;
+            view->setPlaying(true);
+            view->setPaused(false);
+            ma_device_start(&audio->device);
             Fl::add_timeout(0.016, update_cursor_timer, ctx);
         }
     }, ctx);
 
+    // Disable keyboard focus on buttons
+    playBtn->clear_visible_focus();
+    stopBtn->clear_visible_focus();
+    pauseBtn->clear_visible_focus();
+
+    // Actual definition of the onSeekCallback(sample) function variable.
     ctx->view->setOnSeekCallback([ctx](int newSample) {
         ctx->audio->playbackSampleIndex = newSample;
     });
