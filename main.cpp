@@ -14,6 +14,22 @@
 #include <functional>
 
 
+// Forward class declarations.
+class Audio;
+class WaveformView;
+
+// ---- Context Struct ----
+struct AppContext {
+    Audio* audio;
+    WaveformView* view;
+    Fl_Button* playBtn;
+    Fl_Button* stopBtn;
+};
+
+// Forward function declarations.
+void play(AppContext* ctx);
+void stop(AppContext* ctx);
+void pause(AppContext* ctx);
 
 // ---- Audio Class ----
 class Audio {
@@ -140,6 +156,7 @@ public:
 
     // Setters.
 
+    void setContext(AppContext* ctx) { this->ctx = ctx; }
     int getMovedCursorSample() const { return movedCursorSample; }
     void setPlaying(bool state) { playing = state; }
     void setPaused(bool state) { paused = state; }
@@ -306,6 +323,43 @@ protected:
                 return 0;
             }
 
+            case FL_KEYDOWN: {
+                int key = Fl::event_key();
+
+                // Spacebar: ' ' => ASCII code 32.
+                if (key == ' ') {
+                    if (ctx) {
+                        if (isPlaying()) {
+                            stop(ctx);
+                        }
+                        else {
+                            play(ctx);
+                        }
+                       
+                    }
+
+                    return 1;
+                }
+                else if (key == FL_Pause) {
+                    std::cout << "Pause key pressed" << std::endl;
+                    if (ctx) {
+                        pause(ctx);
+                    }
+
+                    return 1;
+                }
+                else if (key == FL_Home) {
+                    std::cout << "Home (Begin) key pressed" << std::endl;
+                    return 1;
+                }
+                else if (key == FL_End) {
+                    std::cout << "End key pressed" << std::endl;
+                    return 1;
+                }
+
+                return 0;
+            } 
+
             default:
                 return Fl_Gl_Window::handle(event);
         }
@@ -325,12 +379,7 @@ private:
     bool paused = false;
     // Position of the cursor when it is manually moved.
     int movedCursorSample = 0;
-};
-
-// ---- Context Struct ----
-struct AppContext {
-    Audio* audio;
-    WaveformView* view;
+    AppContext* ctx = nullptr;
 };
 
 // ---- Timer Callback ----
@@ -400,6 +449,73 @@ bool loadWavToMono(const char* filename, std::vector<float>& outSamples) {
     return true;
 }
 
+void play(AppContext* ctx) 
+{
+    if (!ctx->view->isPlaying()) {
+        ctx->view->setPlaying(true);
+
+        if (ctx->view->isPaused()) {
+            int resetTo = ctx->view->getMovedCursorSample();
+            ctx->audio->playbackSampleIndex = resetTo;
+            // Redraw cursor to its initial position.
+            //ctx->view->setPlaybackSample(resetTo);  
+        }
+        else {
+            ctx->view->setPlaybackSample(0);
+        }
+
+        ctx->audio->start();
+        Fl::add_timeout(0.016, update_cursor_timer, ctx);
+    }
+    else {
+        int resetTo = ctx->view->getMovedCursorSample();
+        ctx->audio->playbackSampleIndex = resetTo;
+        // Redraw cursor to its initial position.
+        //ctx->view->setPlaybackSample(resetTo);  
+    }
+}
+
+void stop(AppContext* ctx) 
+{
+    auto* view = ctx->view;
+    auto* audio = ctx->audio;
+
+    if (view->isPlaying()) {
+        view->setPlaying(false);
+        ma_device_stop(&audio->device);
+    }
+
+    // Cancel possible pause state.
+    view->setPaused(false);
+
+    int resetTo = view->getMovedCursorSample();
+    audio->playbackSampleIndex = resetTo;
+    // Redraw cursor to its initial position.
+    //view->setPlaybackSample(resetTo);
+}
+
+void pause(AppContext* ctx) 
+{
+    auto* view = ctx->view;
+    auto* audio = ctx->audio;
+
+    if (view->isPlaying()) {
+        // Pause
+        view->setPlaying(false);
+        view->setPaused(true);
+        ma_device_stop(&audio->device);
+    }
+    else if (view->isPaused() && !view->isPlaying()) {
+        // Resume from where playback paused
+        int resumeSample = view->getPlaybackSample();
+        audio->playbackSampleIndex = resumeSample;
+        view->setPlaying(true);
+        view->setPaused(false);
+        ma_device_start(&audio->device);
+        Fl::add_timeout(0.016, update_cursor_timer, ctx);
+    }
+}
+
 // ---- Main ----
 int main(int argc, char** argv) {
     if (argc < 2) {
@@ -437,82 +553,27 @@ int main(int argc, char** argv) {
     waveform->setScrollbar(scrollbar);
     waveform->setSamples(samples);
 
-    auto* ctx = new AppContext{ audio, waveform };
+    // Create buttons.
+    Fl_Button* playBtn = new Fl_Button(10, 320, 80, 30, "Play");
+    Fl_Button* stopBtn = new Fl_Button(100, 320, 80, 30, "Stop");
+    Fl_Button* pauseBtn = new Fl_Button(190, 320, 80, 30, "Pause");
+
+    auto* ctx = new AppContext{ audio, waveform, playBtn, pauseBtn };
+    waveform->setContext(ctx);
 
     // --- Play Button ---
-    Fl_Button* playBtn = new Fl_Button(10, 320, 80, 30, "Play");
-
     playBtn->callback([](Fl_Widget*, void* userData) {
-        auto* ctx = static_cast<AppContext*>(userData);
-        if (!ctx->view->isPlaying()) {
-            ctx->view->setPlaying(true);
-
-            if (ctx->view->isPaused()) {
-                int resetTo = ctx->view->getMovedCursorSample();
-                ctx->audio->playbackSampleIndex = resetTo;
-                // Redraw cursor to its initial position.
-                ctx->view->setPlaybackSample(resetTo);  
-            }
-            else {
-                ctx->view->setPlaybackSample(0);
-            }
-
-            ctx->audio->start();
-            Fl::add_timeout(0.016, update_cursor_timer, ctx);
-        }
-        else {
-            int resetTo = ctx->view->getMovedCursorSample();
-            ctx->audio->playbackSampleIndex = resetTo;
-            // Redraw cursor to its initial position.
-            ctx->view->setPlaybackSample(resetTo);  
-        }
+        play(static_cast<AppContext*>(userData));
     }, ctx);
 
     // --- Stop Button ---
-    Fl_Button* stopBtn = new Fl_Button(100, 320, 80, 30, "Stop");
-
     stopBtn->callback([](Fl_Widget*, void* userData) {
-        auto* ctx = static_cast<AppContext*>(userData);
-        auto* view = ctx->view;
-        auto* audio = ctx->audio;
-
-        if (view->isPlaying()) {
-            view->setPlaying(false);
-            ma_device_stop(&audio->device);
-        }
-
-        // Cancel possible pause state.
-        view->setPaused(false);
-
-        int resetTo = view->getMovedCursorSample();
-        audio->playbackSampleIndex = resetTo;
-        // Redraw cursor to its initial position.
-        view->setPlaybackSample(resetTo);  
+        stop(static_cast<AppContext*>(userData));
     }, ctx);
 
     // --- Pause Button ---
-    Fl_Button* pauseBtn = new Fl_Button(190, 320, 80, 30, "Pause");
-
     pauseBtn->callback([](Fl_Widget*, void* userData) {
-        auto* ctx = static_cast<AppContext*>(userData);
-        auto* view = ctx->view;
-        auto* audio = ctx->audio;
-
-        if (view->isPlaying()) {
-            // Pause
-            view->setPlaying(false);
-            view->setPaused(true);
-            ma_device_stop(&audio->device);
-        }
-        else if (view->isPaused() && !view->isPlaying()) {
-            // Resume from where playback paused
-            int resumeSample = view->getPlaybackSample();
-            audio->playbackSampleIndex = resumeSample;
-            view->setPlaying(true);
-            view->setPaused(false);
-            ma_device_start(&audio->device);
-            Fl::add_timeout(0.016, update_cursor_timer, ctx);
-        }
+        pause(static_cast<AppContext*>(userData));
     }, ctx);
 
     // Disable keyboard focus on buttons
