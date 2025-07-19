@@ -30,6 +30,7 @@ struct AppContext {
 void play(AppContext* ctx);
 void stop(AppContext* ctx);
 void pause(AppContext* ctx);
+void resetCursor(AppContext* ctx);
 
 // ---- Audio Class ----
 class Audio {
@@ -44,7 +45,6 @@ public:
     bool init(const std::vector<float>& data, int rate);
 
     void start() {
-        //playbackSampleIndex = 0;
         ma_device_start(&device);
     }
 
@@ -256,12 +256,23 @@ protected:
         }
 
         // --- Draw playback cursor ---
-        if (playbackSample >= 0) {
+        int sampleToDraw = -1;
+
+        if (isPlaying() || isPaused()) {
+            // The cursor moves in realtime (isPlaying) or is shown at its last position (isPaused).
+            sampleToDraw = playbackSample;
+        }
+        else {
+            // The cursor has been manually moved (eg: mouse click, Home key...).
+            sampleToDraw = movedCursorSample;
+        }
+
+        if (sampleToDraw >= 0) {
             int visibleStart = scrollOffset;
             int visibleEnd = scrollOffset + static_cast<int>(std::ceil(w() / zoomLevel));
 
-            if (playbackSample >= visibleStart && playbackSample < visibleEnd) {
-                float x = (playbackSample - scrollOffset) * zoomLevel;
+            if (sampleToDraw >= visibleStart && sampleToDraw < visibleEnd) {
+                float x = (sampleToDraw - scrollOffset) * zoomLevel;
                 glColor3f(1.0f, 0.0f, 0.0f);
                 glLineWidth(1.0f);
                 glBegin(GL_LINES);
@@ -341,20 +352,36 @@ protected:
                     return 1;
                 }
                 else if (key == FL_Pause) {
-                    std::cout << "Pause key pressed" << std::endl;
                     if (ctx) {
                         pause(ctx);
+                        return 1;
                     }
 
-                    return 1;
+                    return 0;
                 }
                 else if (key == FL_Home) {
-                    std::cout << "Home (Begin) key pressed" << std::endl;
-                    return 1;
+                    // Process only when playback is stopped.
+                    if (ctx && !isPlaying()) {
+                        // Reset the audio cursor to the start position.
+                        movedCursorSample = 0;
+                        resetCursor(ctx);
+
+                        return 1;
+                    }
+
+                    return 0;
                 }
                 else if (key == FL_End) {
-                    std::cout << "End key pressed" << std::endl;
-                    return 1;
+                    // Process only when playback is stopped.
+                    if (ctx && !isPlaying()) {
+                        // Take the audio cursor to the end position.
+                        movedCursorSample = static_cast<int>(samples.size()) - 1;
+                        resetCursor(ctx);
+
+                        return 1;
+                    }
+
+                    return 0;
                 }
 
                 return 0;
@@ -449,16 +476,36 @@ bool loadWavToMono(const char* filename, std::vector<float>& outSamples) {
     return true;
 }
 
+void resetCursor(AppContext* ctx) 
+{
+    auto* view = ctx->view;
+    auto* audio = ctx->audio;
+
+    // Get the cursor's starting point.
+    int resetTo = view->getMovedCursorSample();
+    // Reset the cursor to its initial audio position.
+    audio->playbackSampleIndex = resetTo;
+
+    // Compute a target offset before the cursor, (e.g: show 10% of the window before the cursor.)
+    float zoom = view->getZoomLevel();
+    // Number of samples that fit in the view
+    int visibleSamples = static_cast<int>(view->w() / zoom);
+    // Shift back by a percentage of visible samples (e.g., 10%)
+    int marginSamples = static_cast<int>(visibleSamples * 0.1f);
+    // Compute the new scroll offset
+    int newScrollOffset = std::max(0, resetTo - marginSamples);
+    // Apply it.
+    view->setScrollOffset(newScrollOffset);
+    view->redraw();  // 🔧 force the waveform (and cursor) to repaint
+}
+
 void play(AppContext* ctx) 
 {
     if (!ctx->view->isPlaying()) {
         ctx->view->setPlaying(true);
 
         if (ctx->view->isPaused()) {
-            int resetTo = ctx->view->getMovedCursorSample();
-            ctx->audio->playbackSampleIndex = resetTo;
-            // Redraw cursor to its initial position.
-            //ctx->view->setPlaybackSample(resetTo);  
+            resetCursor(ctx);
         }
         else {
             ctx->view->setPlaybackSample(0);
@@ -468,10 +515,7 @@ void play(AppContext* ctx)
         Fl::add_timeout(0.016, update_cursor_timer, ctx);
     }
     else {
-        int resetTo = ctx->view->getMovedCursorSample();
-        ctx->audio->playbackSampleIndex = resetTo;
-        // Redraw cursor to its initial position.
-        //ctx->view->setPlaybackSample(resetTo);  
+        resetCursor(ctx);
     }
 }
 
@@ -488,10 +532,7 @@ void stop(AppContext* ctx)
     // Cancel possible pause state.
     view->setPaused(false);
 
-    int resetTo = view->getMovedCursorSample();
-    audio->playbackSampleIndex = resetTo;
-    // Redraw cursor to its initial position.
-    //view->setPlaybackSample(resetTo);
+    resetCursor(ctx);
 }
 
 void pause(AppContext* ctx) 
@@ -504,6 +545,7 @@ void pause(AppContext* ctx)
         view->setPlaying(false);
         view->setPaused(true);
         ma_device_stop(&audio->device);
+view->redraw();
     }
     else if (view->isPaused() && !view->isPlaying()) {
         // Resume from where playback paused
