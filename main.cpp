@@ -35,14 +35,16 @@ void resetCursor(AppContext* ctx);
 // ---- Audio Class ----
 class Audio {
 public:
-    std::vector<float> samples;
+    //std::vector<float> samples;
+    std::vector<float> leftSamples;
+    std::vector<float> rightSamples;
     std::atomic<int> playbackSampleIndex{0};
     int totalSamples = 0;
     // Update this based on the actual file.
     int sampleRate = 44100;
     ma_device device;
 
-    bool init(const std::vector<float>& data, int rate);
+    bool init(const std::vector<float>& left, const std::vector<float>& right, int rate);
 
     void start() {
         ma_device_start(&device);
@@ -58,40 +60,38 @@ void audio_data_callback(ma_device* pDevice, void* output, const void*, ma_uint3
     float* out = static_cast<float*>(output);
 
     int remaining = self->totalSamples - self->playbackSampleIndex;
-    int samplesToCopy = std::min((int)frameCount, remaining);
+    int framesToCopy = std::min((int)frameCount, remaining);
 
-    if (remaining <= 0) {
-        // Fill silence
-        std::fill(out, out + frameCount, 0.0f);
-        return;
+    // Fill buffer with interleaved stereo samples
+    for (int i = 0; i < framesToCopy; ++i) {
+        int idx = self->playbackSampleIndex++;
+        out[i * 2]     = self->leftSamples[idx];   // Left
+        out[i * 2 + 1] = self->rightSamples[idx];  // Right
     }
 
-    if (samplesToCopy > remaining) {
-        samplesToCopy = remaining;
-    }
-
-    // Copy mono samples
-    for (int i = 0; i < samplesToCopy; ++i) {
-        out[i] = self->samples[self->playbackSampleIndex++];
-    }
-
-    // If less than requested, fill rest with silence
-    for (int i = samplesToCopy; i < (int)frameCount; ++i) {
-        out[i] = 0.0f;
+    // Fill remaining frames with silence
+    for (int i = framesToCopy; i < (int)frameCount; ++i) {
+        out[i * 2]     = 0.0f;
+        out[i * 2 + 1] = 0.0f;
     }
 }
 
-bool Audio::init(const std::vector<float>& data, int rate) {
-    samples = data;
-    totalSamples = static_cast<int>(samples.size());
+
+bool Audio::init(const std::vector<float>& left, const std::vector<float>& right, int rate)
+{
+    // Store the provided audio samples into class members.
+    leftSamples = left;
+    rightSamples = right;
+    // Assuming left and right channels are the same length.
+    totalSamples = static_cast<int>(leftSamples.size());
     sampleRate = rate;
 
     ma_device_config config = ma_device_config_init(ma_device_type_playback);
-    config.playback.format   = ma_format_f32;
-    config.playback.channels = 1;
-    config.sampleRate        = sampleRate;
-    config.dataCallback      = audio_data_callback;
-    config.pUserData         = this;
+    config.playback.format = ma_format_f32;
+    config.playback.channels = 2;
+    config.sampleRate = sampleRate;
+    config.dataCallback = audio_data_callback;
+    config.pUserData = this;
 
     return ma_device_init(nullptr, &config, &device) == MA_SUCCESS;
 }
@@ -112,11 +112,13 @@ public:
         onSeekCallback = callback;
     }
 
-    void setSamples(const std::vector<float>& data) {
-        samples = data;
+    void setStereoSamples(const std::vector<float>& left, const std::vector<float>& right) {
+        leftSamples = left;
+        rightSamples = right;
+
         // Fit entire waveform on screen initially.
-        if (!samples.empty()) {
-            zoomMin = static_cast<float>(w()) / samples.size();
+        if (!leftSamples.empty()) {
+            zoomMin = static_cast<float>(w()) / leftSamples.size();
             zoomLevel = zoomMin;
         }
 
@@ -137,13 +139,13 @@ public:
     }
 
     void updateScrollbar() {
-        if (!scrollbar || samples.empty()) return;
+        if (!scrollbar || leftSamples.empty()) return;
         int visibleSamples = static_cast<int>(w() / zoomLevel);
-        int maxOffset = std::max(0, (int)samples.size() - visibleSamples);
+        int maxOffset = std::max(0, (int)leftSamples.size() - visibleSamples);
         scrollOffset = std::clamp(scrollOffset, 0, maxOffset);
         scrollbar->maximum(maxOffset);
         scrollbar->value(scrollOffset);
-        scrollbar->slider_size((float)visibleSamples / samples.size());
+        scrollbar->slider_size((float)visibleSamples / leftSamples.size());
     }
 
     // Getters.
@@ -171,89 +173,104 @@ protected:
             glLoadIdentity();
             glViewport(0, 0, w(), h());
             // X: pixels, Y: normalized amplitude.
-            glOrtho(0, w(), -1.0, 1.0, -1.0, 1.0); 
+            glOrtho(0, w(), 0, h(), -1.0, 1.0);  // Top to bottom pixel coordinates
         }
+
+        int halfHeight = h() / 2;
 
         // White background.
         glClearColor(1, 1, 1, 1);
         glClear(GL_COLOR_BUFFER_BIT);
 
-        if (samples.empty()) return;
+        if (leftSamples.empty()) return;
 
         // Blue waveform.
         glColor3f(0.0f, 0.0f, 1.0f);
         // Ensure full-pixel lines.
         glLineWidth(1.0f);
 
-        float samplesPerPixel = 1.0f / zoomLevel;
-
-        // Decide rendering mode based on zoom level.
-        if (samplesPerPixel > 5.0f) {
-            // ZOOMED OUT: Envelope (min/max per pixel column)
-            glBegin(GL_LINES);
-
-            for (int x = 0; x < w(); ++x) {
-                int startSample = scrollOffset + static_cast<int>(x * samplesPerPixel);
-                int endSample = scrollOffset + static_cast<int>((x + 1) * samplesPerPixel);
-
-                if (startSample >= (int)samples.size()) {
-                    break;
-                } 
-
-                endSample = std::min(endSample, (int)samples.size());
-                float minY = 1.0f, maxY = -1.0f;
-
-                for (int i = startSample; i < endSample; ++i) {
-                    float s = samples[i];
-                    if (s < minY) minY = s;
-                    if (s > maxY) maxY = s;
-                }
-
-                // Avoid disappearing lines: pad very flat sections
-                if (std::abs(maxY - minY) < 0.01f) {
-                    minY -= 0.005f; maxY += 0.005f;
-                }
-
-                // Clamp to [-1, 1] to stay inside viewport.
-                glVertex2f(x, std::clamp(minY, -1.0f, 1.0f));
-                glVertex2f(x, std::clamp(maxY, -1.0f, 1.0f));
-            }
-            glEnd();
-        }
-        else {
-            // ZOOMED IN: One sample per vertex, smooth line.
-            glBegin(GL_LINE_STRIP);
-
-            // Note: Add +1 sample to visible range to ensure last visible pixel is drawn.
-            int visibleSamples = static_cast<int>(std::ceil(w() / zoomLevel)) + 1;
-            int endSample = std::min(scrollOffset + visibleSamples, (int)samples.size());
-
-            for (int i = scrollOffset; i < endSample; ++i) {
-                float x = (i - scrollOffset) * zoomLevel;
-                // Stay in range.
-                float y = std::clamp(samples[i], -1.0f, 1.0f);
-                glVertex2f(x, y);
-            }
-
-            glEnd();
-
-            // --- Draw nodes if zoomed in enough ---
+        // Lambda function that draws a channel.
+        auto drawChannel = [&](const std::vector<float>& channel, int yOffset, int heightPx) {
             float samplesPerPixel = 1.0f / zoomLevel;
 
-            if (samplesPerPixel <= 0.1f) {
-                glColor3f(1.0f, 0.0f, 0.0f); // red nodes
-                glPointSize(4.0f);           // size of each node
-                glBegin(GL_POINTS);
+            // Decide rendering mode based on zoom level.
+            if (samplesPerPixel > 5.0f) {
+                // ZOOMED OUT: Envelope (min/max per pixel column)
+                glBegin(GL_LINES);
+
+                for (int x = 0; x < w(); ++x) {
+                    int startSample = scrollOffset + static_cast<int>(x * samplesPerPixel);
+                    int endSample = std::min(scrollOffset + static_cast<int>((x + 1) * samplesPerPixel), (int)channel.size());
+
+                    float minY = 1.0f, maxY = -1.0f;
+                    for (int i = startSample; i < endSample; ++i) {
+                        float s = channel[i];
+                        minY = std::min(minY, s);
+                        maxY = std::max(maxY, s);
+                    }
+
+                    if (std::abs(maxY - minY) < 0.0001f) {
+                        // Flat silent section → draw a thin horizontal line
+                        float yFlatPx = yOffset + (1.0f - 0.0f) * (heightPx / 2.0f);  // Amplitude 0
+
+                        glVertex2f(x, yFlatPx);
+                        // 1-pixel wide horizontal line.
+                        glVertex2f(x + 1, yFlatPx);  
+                        // Skip the rest of loop.
+                        continue;  
+                    }
+
+                    float yMinPx = yOffset + (1.0f - std::clamp(minY, -1.0f, 1.0f)) * (heightPx / 2.0f);
+                    float yMaxPx = yOffset + (1.0f - std::clamp(maxY, -1.0f, 1.0f)) * (heightPx / 2.0f);
+
+                    glVertex2f(x, yMinPx);
+                    glVertex2f(x, yMaxPx);
+                }
+                glEnd();
+            }
+            else {
+                // ZOOMED IN: One sample per vertex, smooth line.
+                glBegin(GL_LINE_STRIP);
+
+                // Note: Add +1 sample to visible range to ensure last visible pixel is drawn.
+                int visibleSamples = static_cast<int>(std::ceil(w() / zoomLevel)) + 1;
+                int endSample = std::min(scrollOffset + visibleSamples, (int)channel.size());
 
                 for (int i = scrollOffset; i < endSample; ++i) {
                     float x = (i - scrollOffset) * zoomLevel;
-                    float y = std::clamp(samples[i], -1.0f, 1.0f);
+                    float y = yOffset + (1.0f - std::clamp(channel[i], -1.0f, 1.0f)) * (heightPx / 2.0f);
                     glVertex2f(x, y);
                 }
 
                 glEnd();
+
+                // --- Draw nodes if zoomed in enough ---
+                float samplesPerPixel = 1.0f / zoomLevel;
+
+                if (samplesPerPixel <= 0.1f) {
+                    glColor3f(1.0f, 0.0f, 0.0f); // red nodes
+                    glPointSize(4.0f);           // size of each node
+                    glBegin(GL_POINTS);
+
+                    for (int i = scrollOffset; i < endSample; ++i) {
+                        float x = (i - scrollOffset) * zoomLevel;
+                        //float y = std::clamp(channel[i], -1.0f, 1.0f);
+                        float y = yOffset + (1.0f - std::clamp(channel[i], -1.0f, 1.0f)) * (heightPx / 2.0f);
+                        glVertex2f(x, y);
+                    }
+
+                    glEnd();
+                }
             }
-        }
+        };
+
+        // Draw both left and right channels.
+        glColor3f(0.0f, 0.0f, 1.0f); // Left: blue
+        drawChannel(leftSamples, 0, halfHeight);
+
+        glColor3f(0.0f, 0.5f, 0.0f); // Right: green
+        drawChannel(rightSamples, halfHeight, halfHeight);
+
 
         // --- Draw playback cursor ---
         int sampleToDraw = -1;
@@ -276,8 +293,9 @@ protected:
                 glColor3f(1.0f, 0.0f, 0.0f);
                 glLineWidth(1.0f);
                 glBegin(GL_LINES);
-                glVertex2f(x, -1.0f);
-                glVertex2f(x, 1.0f);
+                glVertex2f(x, 0);
+                glVertex2f(x, h());
+
                 glEnd();
             }
         }
@@ -295,13 +313,12 @@ protected:
 
             // Zoom with mouse wheel
             case FL_MOUSEWHEEL: {
-                // 1.1f = zoom in / 0.9f = zoom out.
                 zoomLevel *= (Fl::event_dy() < 0) ? 1.1f : 0.9f;
 
                 zoomLevel = std::clamp(zoomLevel, zoomMin, 100.0f);
 
                 int visibleSamples = static_cast<int>(w() / zoomLevel);
-                int maxOffset = std::max(0, (int)samples.size() - visibleSamples);
+                int maxOffset = std::max(0, (int)leftSamples.size() - visibleSamples);
                 scrollOffset = std::clamp(scrollOffset, 0, maxOffset);
 
                 updateScrollbar();
@@ -317,7 +334,7 @@ protected:
                     int sample = scrollOffset + static_cast<int>(mouseX / zoomLevel);
 
                     // Clamp within sample range
-                    sample = std::clamp(sample, 0, (int)samples.size() - 1);
+                    sample = std::clamp(sample, 0, (int)leftSamples.size() - 1);
 
                     setPlaybackSample(sample);
                     movedCursorSample = sample;
@@ -375,7 +392,7 @@ protected:
                     // Process only when playback is stopped.
                     if (ctx && !isPlaying()) {
                         // Take the audio cursor to the end position.
-                        movedCursorSample = static_cast<int>(samples.size()) - 1;
+                        movedCursorSample = static_cast<int>(leftSamples.size()) - 1;
                         resetCursor(ctx);
 
                         return 1;
@@ -393,7 +410,8 @@ protected:
     }
 
 private:
-    std::vector<float> samples;
+    std::vector<float> leftSamples;
+    std::vector<float> rightSamples;
     Fl_Scrollbar* scrollbar = nullptr;
     // Auto-calculated minimum zoom (fit to screen).
     float zoomMin = 0.01f;
@@ -437,41 +455,51 @@ void update_cursor_timer(void* userdata) {
 }
 
 // ---- WAV Loader ----
-bool loadWavToMono(const char* filename, std::vector<float>& outSamples) {
-    ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 0, 0);
+bool loadWavStereo(const std::string& path, std::vector<float>& left, std::vector<float>& right) {
+    // Force float output
+    ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 0, 0);  
     ma_decoder decoder;
 
-    if (ma_decoder_init_file(filename, &config, &decoder) != MA_SUCCESS) {
+    if (ma_decoder_init_file(path.c_str(), &config, &decoder) != MA_SUCCESS) {
+        std::cerr << "Failed to load WAV file: " << path << std::endl;
         return false;
     }
 
-    ma_uint64 totalFrames;
-
-    if (ma_decoder_get_length_in_pcm_frames(&decoder, &totalFrames) != MA_SUCCESS) {
+    ma_uint64 frameCount = 0;
+    if (ma_decoder_get_length_in_pcm_frames(&decoder, &frameCount) != MA_SUCCESS) {
+        std::cerr << "Failed to get length" << std::endl;
+        ma_decoder_uninit(&decoder);
         return false;
-    } 
+    }
 
-    std::vector<float> interleaved(totalFrames * decoder.outputChannels);
-    ma_uint64 framesRead;
+    std::vector<float> tempData(static_cast<size_t>(frameCount * decoder.outputChannels));
 
-    if (ma_decoder_read_pcm_frames(&decoder, interleaved.data(), totalFrames, &framesRead) != MA_SUCCESS) {
+    ma_uint64 framesRead = 0;
+    if (ma_decoder_read_pcm_frames(&decoder, tempData.data(), frameCount, &framesRead) != MA_SUCCESS) {
+        std::cerr << "Failed to read PCM frames" << std::endl;
+        ma_decoder_uninit(&decoder);
         return false;
     }
 
     ma_decoder_uninit(&decoder);
 
-    // Convert to mono
-    outSamples.resize(framesRead);
-
-    for (ma_uint64 i = 0; i < framesRead; ++i) {
-        float sample = 0.0f;
-
-        for (ma_uint32 ch = 0; ch < decoder.outputChannels; ++ch) {
-            sample += interleaved[i * decoder.outputChannels + ch];
-        }
-
-        outSamples[i] = sample / decoder.outputChannels;
+    // Split into left/right channels
+    left.clear();  right.clear();
+    for (size_t i = 0; i < framesRead; ++i) {
+        left.push_back(tempData[i * decoder.outputChannels]);
+        right.push_back(tempData[i * decoder.outputChannels + 1]);
     }
+
+    // 🔍 Log a few values to debug
+    std::cout << "Left channel [0..5]: ";
+    for (int i = 0; i < 5 && i < (int)left.size(); ++i)
+        std::cout << left[i] << " ";
+    std::cout << "\n";
+
+    std::cout << "Right channel [0..5]: ";
+    for (int i = 0; i < 5 && i < (int)right.size(); ++i)
+        std::cout << right[i] << " ";
+    std::cout << "\n";
 
     return true;
 }
@@ -496,7 +524,8 @@ void resetCursor(AppContext* ctx)
     int newScrollOffset = std::max(0, resetTo - marginSamples);
     // Apply it.
     view->setScrollOffset(newScrollOffset);
-    view->redraw();  // 🔧 force the waveform (and cursor) to repaint
+    // 🔧 force the waveform (and cursor) to repaint
+    view->redraw();  
 }
 
 void play(AppContext* ctx) 
@@ -565,14 +594,22 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    std::vector<float> samples;
-    if (!loadWavToMono(argv[1], samples)) {
+    std::vector<float> left;
+    std::vector<float> right;
+
+    if (!loadWavStereo(argv[1], left, right)) {
         std::cerr << "Failed to load WAV file.\n";
         return 1;
     }
 
+    // Make sure each channel has the same number of audio samples.
+    if (left.size() != right.size()) {
+        std::cerr << "Error: Left and right channels have different lengths!" << std::endl;
+        return false;
+    }
+
     auto* audio = new Audio();
-    if (!audio->init(samples, 44100)) {
+    if (!audio->init(left, right, 44100)) {
         std::cerr << "Failed to initialize audio.\n";
         return 1;
     }
@@ -593,7 +630,7 @@ int main(int argc, char** argv) {
     }, waveform);
 
     waveform->setScrollbar(scrollbar);
-    waveform->setSamples(samples);
+    waveform->setStereoSamples(left, right);
 
     // Create buttons.
     Fl_Button* playBtn = new Fl_Button(10, 320, 80, 30, "Play");
