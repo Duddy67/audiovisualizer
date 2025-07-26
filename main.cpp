@@ -35,7 +35,6 @@ void resetCursor(AppContext* ctx);
 // ---- Audio Class ----
 class Audio {
 public:
-    //std::vector<float> samples;
     std::vector<float> leftSamples;
     std::vector<float> rightSamples;
     std::atomic<int> playbackSampleIndex{0};
@@ -65,8 +64,10 @@ void audio_data_callback(ma_device* pDevice, void* output, const void*, ma_uint3
     // Fill buffer with interleaved stereo samples
     for (int i = 0; i < framesToCopy; ++i) {
         int idx = self->playbackSampleIndex++;
-        out[i * 2]     = self->leftSamples[idx];   // Left
-        out[i * 2 + 1] = self->rightSamples[idx];  // Right
+        // Left
+        out[i * 2]     = self->leftSamples[idx];   
+        // Right
+        out[i * 2 + 1] = self->rightSamples[idx];  
     }
 
     // Fill remaining frames with silence
@@ -115,6 +116,9 @@ public:
     void setStereoSamples(const std::vector<float>& left, const std::vector<float>& right) {
         leftSamples = left;
         rightSamples = right;
+
+        // Crude check, or pass in a flag.
+        isStereo = (left != right);  
 
         // Fit entire waveform on screen initially.
         if (!leftSamples.empty()) {
@@ -166,6 +170,7 @@ public:
         playbackSample = sample;
         redraw();
     }
+    void setStereoMode(bool stereo) { isStereo = stereo; }
 
 protected:
     void draw() override {
@@ -173,7 +178,8 @@ protected:
             glLoadIdentity();
             glViewport(0, 0, w(), h());
             // X: pixels, Y: normalized amplitude.
-            glOrtho(0, w(), 0, h(), -1.0, 1.0);  // Top to bottom pixel coordinates
+            // Top to bottom pixel coordinates
+            glOrtho(0, w(), 0, h(), -1.0, 1.0);  
         }
 
         int halfHeight = h() / 2;
@@ -209,7 +215,17 @@ protected:
                         maxY = std::max(maxY, s);
                     }
 
-                    if (std::abs(maxY - minY) < 0.0001f) {
+                    bool isSilent = true;
+
+                    for (int i = startSample; i < endSample; ++i) {
+                        // Noise threshold
+                        if (std::abs(channel[i]) > 0.005f) {  
+                            isSilent = false;
+                            break;
+                        }
+                    }
+
+                    if (isSilent) {
                         // Flat silent section → draw a thin horizontal line
                         float yFlatPx = yOffset + (1.0f - 0.0f) * (heightPx / 2.0f);  // Amplitude 0
 
@@ -218,6 +234,12 @@ protected:
                         glVertex2f(x + 1, yFlatPx);  
                         // Skip the rest of loop.
                         continue;  
+                    }
+
+                    // Avoid disappearing lines: pad very flat sections
+                    // Note: Near-flat, but not completely silent → pad it
+                    if (std::abs(maxY - minY) < 0.01f) {
+                        minY -= 0.005f; maxY += 0.005f;
                     }
 
                     float yMinPx = yOffset + (1.0f - std::clamp(minY, -1.0f, 1.0f)) * (heightPx / 2.0f);
@@ -254,7 +276,6 @@ protected:
 
                     for (int i = scrollOffset; i < endSample; ++i) {
                         float x = (i - scrollOffset) * zoomLevel;
-                        //float y = std::clamp(channel[i], -1.0f, 1.0f);
                         float y = yOffset + (1.0f - std::clamp(channel[i], -1.0f, 1.0f)) * (heightPx / 2.0f);
                         glVertex2f(x, y);
                     }
@@ -264,12 +285,30 @@ protected:
             }
         };
 
-        // Draw both left and right channels.
-        glColor3f(0.0f, 0.0f, 1.0f); // Left: blue
-        drawChannel(leftSamples, 0, halfHeight);
+        if (isStereo) {
+            // Draw both left and right channels.
+            glColor3f(0.0f, 0.0f, 1.0f); // Left: blue
+            drawChannel(leftSamples, 0, halfHeight);
 
-        glColor3f(0.0f, 0.5f, 0.0f); // Right: green
-        drawChannel(rightSamples, halfHeight, halfHeight);
+            glColor3f(0.0f, 0.5f, 0.0f); // Right: green
+            drawChannel(rightSamples, halfHeight, halfHeight);
+
+            // --- Draw separation line between waveforms ---
+
+            // light gray
+            glColor3f(0.8f, 0.8f, 0.8f); 
+            glLineWidth(1.0f);
+            glBegin(GL_LINES);
+            // from left
+            glVertex2f(0, h() / 2);     
+            // to right
+            glVertex2f(w(), h() / 2);   
+            glEnd();
+        }
+        // mono = full height
+        else {
+            drawChannel(leftSamples, 0, h());  
+        }
 
 
         // --- Draw playback cursor ---
@@ -422,6 +461,7 @@ private:
     int playbackSample = -1;
     bool playing = false;
     bool paused = false;
+    bool isStereo = true;
     // Position of the cursor when it is manually moved.
     int movedCursorSample = 0;
     AppContext* ctx = nullptr;
@@ -455,7 +495,7 @@ void update_cursor_timer(void* userdata) {
 }
 
 // ---- WAV Loader ----
-bool loadWavStereo(const std::string& path, std::vector<float>& left, std::vector<float>& right) {
+bool loadWavStereo(const std::string& path, std::vector<float>& left, std::vector<float>& right, bool& isStereo) {
     // Force float output
     ma_decoder_config config = ma_decoder_config_init(ma_format_f32, 0, 0);  
     ma_decoder decoder;
@@ -483,23 +523,23 @@ bool loadWavStereo(const std::string& path, std::vector<float>& left, std::vecto
 
     ma_decoder_uninit(&decoder);
 
-    // Split into left/right channels
-    left.clear();  right.clear();
-    for (size_t i = 0; i < framesRead; ++i) {
-        left.push_back(tempData[i * decoder.outputChannels]);
-        right.push_back(tempData[i * decoder.outputChannels + 1]);
+    if (decoder.outputChannels == 1) {
+        // Mono data
+        left = std::vector<float>(tempData);  
+        // Mirror for playback
+        right = left;                         
+        isStereo = false;
     }
+    else {
+        // Split into left/right channels
+        left.clear();  right.clear();
+        for (size_t i = 0; i < framesRead; ++i) {
+            left.push_back(tempData[i * decoder.outputChannels]);
+            right.push_back(tempData[i * decoder.outputChannels + 1]);
+        }
 
-    // 🔍 Log a few values to debug
-    std::cout << "Left channel [0..5]: ";
-    for (int i = 0; i < 5 && i < (int)left.size(); ++i)
-        std::cout << left[i] << " ";
-    std::cout << "\n";
-
-    std::cout << "Right channel [0..5]: ";
-    for (int i = 0; i < 5 && i < (int)right.size(); ++i)
-        std::cout << right[i] << " ";
-    std::cout << "\n";
+        isStereo = true;
+    }
 
     return true;
 }
@@ -524,7 +564,7 @@ void resetCursor(AppContext* ctx)
     int newScrollOffset = std::max(0, resetTo - marginSamples);
     // Apply it.
     view->setScrollOffset(newScrollOffset);
-    // 🔧 force the waveform (and cursor) to repaint
+    // Force the waveform (and cursor) to repaint
     view->redraw();  
 }
 
@@ -574,7 +614,6 @@ void pause(AppContext* ctx)
         view->setPlaying(false);
         view->setPaused(true);
         ma_device_stop(&audio->device);
-view->redraw();
     }
     else if (view->isPaused() && !view->isPlaying()) {
         // Resume from where playback paused
@@ -596,11 +635,13 @@ int main(int argc, char** argv) {
 
     std::vector<float> left;
     std::vector<float> right;
+    bool isStereo;
 
-    if (!loadWavStereo(argv[1], left, right)) {
+    if (!loadWavStereo(argv[1], left, right, isStereo)) {
         std::cerr << "Failed to load WAV file.\n";
         return 1;
     }
+
 
     // Make sure each channel has the same number of audio samples.
     if (left.size() != right.size()) {
@@ -617,6 +658,7 @@ int main(int argc, char** argv) {
     Fl_Window win(800, 400, "Waveform Viewer");
     auto* waveform = new WaveformView(10, 10, 780, 280);
     waveform->take_focus();  // Request keyboard focus
+    waveform->setStereoMode(isStereo);  // update visual behavior
 
     auto* scrollbar = new Fl_Scrollbar(10, 295, 780, 15);
     scrollbar->type(FL_HORIZONTAL);
