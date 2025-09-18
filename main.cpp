@@ -122,8 +122,23 @@ public:
 
         // Fit entire waveform on screen initially.
         if (!leftSamples.empty()) {
-            zoomMin = static_cast<float>(w()) / leftSamples.size();
-            zoomLevel = zoomMin;
+            // Compute fit-to-screen zoom (pixels per sample that fits entire file).
+            zoomFit = static_cast<float>(w()) / static_cast<float>(leftSamples.size());
+            // Allow zooming out beyond fit-to-screen.
+            // Note: Tweak factor (0.01 = 100× smaller than fit).
+            zoomMin = zoomFit * 0.01f;   
+
+            if (zoomMax <= zoomMin) {
+                // Fallback if zoomMax wasn't sensible.
+                zoomMax = zoomMin * 100.0f;    
+            }
+
+            // Start at fit-to-screen.
+            zoomLevel = zoomFit;
+        }
+        else {
+            zoomLevel = 1.0f;
+            zoomFit = zoomMin = 1.0f;
         }
 
         scrollOffset = 0;
@@ -352,11 +367,21 @@ protected:
 
             // Zoom with mouse wheel
             case FL_MOUSEWHEEL: {
-                zoomLevel *= (Fl::event_dy() < 0) ? 1.1f : 0.9f;
+                //zoomLevel *= (Fl::event_dy() < 0) ? 1.1f : 0.9f;
+                // zoom in/out
+                if (Fl::event_dy() < 0) {
+                    zoomLevel *= 1.1f;  // zoom in
+                }
+                else {
+                    zoomLevel *= 0.9f;  // zoom out
+                }
 
-                zoomLevel = std::clamp(zoomLevel, zoomMin, 100.0f);
+                //zoomLevel = std::clamp(zoomLevel, zoomMin, 100.0f);
+                zoomLevel = std::clamp(zoomLevel, zoomMin, zoomMax);
 
-                int visibleSamples = static_cast<int>(w() / zoomLevel);
+                //int visibleSamples = static_cast<int>(w() / zoomLevel);
+                // re-clamp scrollOffset to keep view valid
+                int visibleSamples = visibleSamplesCount();
                 int maxOffset = std::max(0, (int)leftSamples.size() - visibleSamples);
                 scrollOffset = std::clamp(scrollOffset, 0, maxOffset);
 
@@ -453,9 +478,15 @@ private:
     std::vector<float> rightSamples;
     Fl_Scrollbar* scrollbar = nullptr;
     // Auto-calculated minimum zoom (fit to screen).
-    float zoomMin = 0.01f;
+    //float zoomMin = 0.01f;
     // Pixels per sample.
     float zoomLevel = 1.0f;
+    // Fit-to-screen (current starting zoom)
+    float zoomFit = 1.0f;     
+    // Allow zooming out further
+    float zoomMin = 1.0f;     
+    // Allow up to 10 pixels per sample
+    float zoomMax = 10.0f; 
     int scrollOffset = 0;
     // -1 = not playing
     int playbackSample = -1;
@@ -465,6 +496,15 @@ private:
     // Position of the cursor when it is manually moved.
     int movedCursorSample = 0;
     AppContext* ctx = nullptr;
+    // helper to compute how many samples fit inside the widget width at current zoom
+    int visibleSamplesCount() const {
+        if (zoomLevel <= 0.0f) return (int)leftSamples.size();
+        // number of samples that correspond to the width: ceil(w / zoomLevel)
+        int vs = static_cast<int>(std::ceil(static_cast<float>(w()) / zoomLevel));
+        vs = std::max(1, vs);
+        vs = std::min((int)leftSamples.size(), vs);
+        return vs;
+    }
 };
 
 // ---- Timer Callback ----
@@ -708,6 +748,7 @@ int main(int argc, char** argv) {
     });
 
 
+    win.resizable(ctx->view);
     win.end();
     win.show();
     return Fl::run();
