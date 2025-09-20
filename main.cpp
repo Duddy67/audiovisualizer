@@ -6,12 +6,14 @@
 #include <FL/Fl_Gl_Window.H>
 #include <FL/Fl_Scrollbar.H>
 #include <FL/Fl_Button.H>
+#include <FL/Fl_Group.H>
 #include <vector>
 #include <iostream>
 #include <cmath>
 #include <algorithm>
 #include <atomic>
 #include <functional>
+#include <memory>
 
 
 // Forward class declarations.
@@ -42,6 +44,8 @@ public:
     // Update this based on the actual file.
     int sampleRate = 44100;
     ma_device device;
+    // End of file flag.
+    bool eof = false;
 
     bool init(const std::vector<float>& left, const std::vector<float>& right, int rate);
 
@@ -60,6 +64,11 @@ void audio_data_callback(ma_device* pDevice, void* output, const void*, ma_uint3
 
     int remaining = self->totalSamples - self->playbackSampleIndex;
     int framesToCopy = std::min((int)frameCount, remaining);
+
+    // Check for end of file.
+    if (remaining == 0 && !self->eof) {
+        self->eof = true;
+    }
 
     // Fill buffer with interleaved stereo samples
     for (int i = 0; i < framesToCopy; ++i) {
@@ -205,6 +214,7 @@ protected:
 
         if (leftSamples.empty()) return;
 
+
         // Blue waveform.
         glColor3f(0.0f, 0.0f, 1.0f);
         // Ensure full-pixel lines.
@@ -300,18 +310,40 @@ protected:
             }
         };
 
+        // If waveform doesn't fill the full width, paint the rest in grey
+        int totalSamples = leftSamples.size();
+        int visibleSamples = visibleSamplesCount();
+        int endSample = scrollOffset + visibleSamples;
+        // compute last drawn x position
+        float lastX = (float)(std::min(endSample, totalSamples) - scrollOffset) * zoomLevel;
+
+        if (lastX < (float)w()) {
+            glBegin(GL_QUADS);
+                // grey background
+                glColor3f(0.3f, 0.3f, 0.3f); 
+                // top-right
+                glVertex2f((float)w(), (float)h()); 
+                // top-left
+                glVertex2f(lastX, (float)h()); 
+                // bottom-left
+                glVertex2f(lastX, 0.0f);       
+                // bottom-right
+                glVertex2f((float)w(), 0.0f);       
+            glEnd();
+        }
+
+        // Waveform color (blue).
+        glColor3f(0.0f, 0.0f, 1.0f); 
+
         if (isStereo) {
             // Draw both left and right channels.
-            glColor3f(0.0f, 0.0f, 1.0f); // Left: blue
             drawChannel(leftSamples, 0, halfHeight);
-
-            glColor3f(0.0f, 0.5f, 0.0f); // Right: green
             drawChannel(rightSamples, halfHeight, halfHeight);
 
             // --- Draw separation line between waveforms ---
 
-            // light gray
-            glColor3f(0.8f, 0.8f, 0.8f); 
+            // Dim gray
+            glColor3f(0.412f, 0.412f, 0.412f); 
             glLineWidth(1.0f);
             glBegin(GL_LINES);
             // from left
@@ -319,12 +351,32 @@ protected:
             // to right
             glVertex2f(w(), h() / 2);   
             glEnd();
+
+            // --- Draw zero lines (middle line) for both channels. ---
+
+            // Gainsboro
+            glColor3f(0.863f, 0.863f, 0.863f); 
+            glBegin(GL_LINES);
+                glLineWidth(1.0f);
+                glVertex2f(0.0f,    halfHeight + (halfHeight / 2));
+                glVertex2f((float)w(), halfHeight + (halfHeight / 2));
+                //
+                glLineWidth(1.0f);
+                glVertex2f(0.0f,    halfHeight / 2.0f);
+                glVertex2f((float)w(), halfHeight / 2.0f);
+            glEnd();
         }
         // mono = full height
         else {
             drawChannel(leftSamples, 0, h());  
+            // --- Draw zero line (middle line). ---
+            glColor3f(0.863f, 0.863f, 0.863f); 
+            glBegin(GL_LINES);
+                glLineWidth(1.0f);
+                glVertex2f(0.0f,    halfHeight);
+                glVertex2f((float)w(), halfHeight);
+            glEnd();
         }
-
 
         // --- Draw playback cursor ---
         int sampleToDraw = -1;
@@ -349,7 +401,6 @@ protected:
                 glBegin(GL_LINES);
                 glVertex2f(x, 0);
                 glVertex2f(x, h());
-
                 glEnd();
             }
         }
@@ -367,7 +418,6 @@ protected:
 
             // Zoom with mouse wheel
             case FL_MOUSEWHEEL: {
-                //zoomLevel *= (Fl::event_dy() < 0) ? 1.1f : 0.9f;
                 // zoom in/out
                 if (Fl::event_dy() < 0) {
                     zoomLevel *= 1.1f;  // zoom in
@@ -376,7 +426,6 @@ protected:
                     zoomLevel *= 0.9f;  // zoom out
                 }
 
-                //zoomLevel = std::clamp(zoomLevel, zoomMin, 100.0f);
                 zoomLevel = std::clamp(zoomLevel, zoomMin, zoomMax);
 
                 //int visibleSamples = static_cast<int>(w() / zoomLevel);
@@ -421,6 +470,11 @@ protected:
                 // Spacebar: ' ' => ASCII code 32.
                 if (key == ' ') {
                     if (ctx) {
+                        if (isPaused() || ctx->audio->eof) {
+                          stop(ctx);
+                          ctx->audio->eof = false;
+                        }
+
                         if (isPlaying()) {
                             stop(ctx);
                         }
@@ -478,7 +532,6 @@ private:
     std::vector<float> rightSamples;
     Fl_Scrollbar* scrollbar = nullptr;
     // Auto-calculated minimum zoom (fit to screen).
-    //float zoomMin = 0.01f;
     // Pixels per sample.
     float zoomLevel = 1.0f;
     // Fit-to-screen (current starting zoom)
@@ -610,11 +663,16 @@ void resetCursor(AppContext* ctx)
 
 void play(AppContext* ctx) 
 {
+    if (ctx->view->isPlaying() && ctx->audio->eof) {
+        ctx->view->setPlaying(false);
+    }
+
     if (!ctx->view->isPlaying()) {
         ctx->view->setPlaying(true);
 
-        if (ctx->view->isPaused()) {
+        if (ctx->view->isPaused() || ctx->audio->eof) {
             resetCursor(ctx);
+            ctx->audio->eof = false;
         }
         else {
             ctx->view->setPlaybackSample(0);
@@ -714,10 +772,13 @@ int main(int argc, char** argv) {
     waveform->setScrollbar(scrollbar);
     waveform->setStereoSamples(left, right);
 
+    Fl_Group* btns = new Fl_Group(10, 320, 240, 30);
     // Create buttons.
     Fl_Button* playBtn = new Fl_Button(10, 320, 80, 30, "Play");
     Fl_Button* stopBtn = new Fl_Button(100, 320, 80, 30, "Stop");
     Fl_Button* pauseBtn = new Fl_Button(190, 320, 80, 30, "Pause");
+    btns->end();
+    btns->resizable((Fl_Widget*)0); // no resizing
 
     auto* ctx = new AppContext{ audio, waveform, playBtn, pauseBtn };
     waveform->setContext(ctx);
@@ -747,7 +808,7 @@ int main(int argc, char** argv) {
         ctx->audio->playbackSampleIndex = newSample;
     });
 
-
+    // Make the waveform view resizable.
     win.resizable(ctx->view);
     win.end();
     win.show();
